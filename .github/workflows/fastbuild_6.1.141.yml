@@ -94,7 +94,7 @@ on:
         description: 'CachyOS/UKSM调优补丁列表(逗号分隔,按顺序应用; 支持: bore,bore-tuning-sysctl,lrng,high-hz,vma,rt,uksm; 留空则不应用)'
         required: false
         type: string
-        default: 'bore,bore-tuning-sysctl,lrng,high-hz,vma,rt,uksm'
+        default: 'bore,rt'
       hz_rate:
         description: '内核定时器刷新率HZ(常用100/250/300/500/1000,默认250)'
         required: false
@@ -263,7 +263,7 @@ jobs:
           if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" || ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
             echo "正在配置BakaSU（由于SukiSU长期未维护无法正常编译，且BakaSU兼容sukisu管理器，故SukiSU源码仓库已重定向为bakasu）..."
             curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
-            echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@overdosed"' >> ./common/arch/arm64/configs/gki_defconfig
+            echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
             cd ./KernelSU
             # 生成自定义版本号（基于提交计数）, 失败时使用 114514
             KSU_VERSION=$(expr $(git rev-list --count main) + 30700 2>/dev/null || echo 114514)
@@ -372,7 +372,7 @@ jobs:
               ["high-hz"]="https://raw.githubusercontent.com/CachyOS/kernel-patches/master/6.1/misc/0001-high-hz.patch"
               ["vma"]="https://raw.githubusercontent.com/CachyOS/kernel-patches/master/6.1/misc/0001-Introduce-per-VMA-lock.patch"
               ["uksm"]="https://raw.githubusercontent.com/sroeschus/uksm/main/v6.x/uksm-v6.1.patch"
-              ["rt"]="https://cdn.kernel.org/pub/linux/kernel/projects/rt/6.1/older/patch-6.1.141-rt52.patch.gz"
+              ["rt"]="https://raw.githubusercontent.com/CachyOS/kernel-patches/master/6.1/misc/0001-rt.patch"
             )
 
             for p in "${PATCH_LIST[@]}"; do
@@ -385,12 +385,7 @@ jobs:
               out="/tmp/cachy_patches/${p}.patch"
               echo ">>> 下载补丁: $p"
               echo "    URL: $url"
-              if [[ "$p" == "rt" ]]; then
-                wget -q -O "/tmp/cachy_patches/${p}.patch.gz" "$url"
-                gunzip -c "/tmp/cachy_patches/${p}.patch.gz" > "$out"
-              else
-                wget -q -O "$out" "$url"
-              fi
+              wget -q -O "$out" "$url"
               if [[ ! -s "$out" ]]; then
                 echo "❌ 下载失败或文件为空: $p"
                 exit 1
