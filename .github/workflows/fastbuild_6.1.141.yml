@@ -90,21 +90,6 @@ on:
         required: true
         type: boolean
         default: 'false'
-      enable_bore:
-        description: '添加 BORE 调度器(含 BTS 调优; 补丁来自仓库 other_patch/)'
-        required: true
-        type: boolean
-        default: 'false'
-      preempt_voluntary:
-        description: '使用自愿抢占(PREEMPT_VOLUNTARY; 关闭则为内核原有抢占模型)'
-        required: true
-        type: boolean
-        default: 'false'
-      hz_rate:
-        description: '内核定时器刷新率HZ(添加 BORE 时生效; 常用100/250/300/500/1000)'
-        required: false
-        type: string
-        default: '250'
       kernel_suffix:
         description: '内核后缀(留空默认,开头别加连字符,勿加空格等影响指令运行的保留字符)'
         required: false
@@ -268,7 +253,7 @@ jobs:
           if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" || ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
             echo "正在配置BakaSU（由于SukiSU长期未维护无法正常编译，且BakaSU兼容sukisu管理器，故SukiSU源码仓库已重定向为bakasu）..."
             curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
-            echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@overdosed"' >> ./common/arch/arm64/configs/gki_defconfig
+            echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
             cd ./KernelSU
             # 生成自定义版本号（基于提交计数）, 失败时使用 114514
             KSU_VERSION=$(expr $(git rev-list --count main) + 30700 2>/dev/null || echo 114514)
@@ -355,107 +340,6 @@ jobs:
           cp ../SukiSU_patch/other/zram/zram_patch/${{ env.KERNEL_VERSION }}/lz4kd.patch ./
           patch -p1 -F 3 < lz4kd.patch || true
           
-      - name: 添加 BORE 调度器
-        if: inputs.enable_bore
-        run: |
-          set -euo pipefail
-          cd kernel_workspace/common
-          HZ_RATE="${{ github.event.inputs.hz_rate }}"
-          HZ_RATE="${HZ_RATE:-250}"
-
-          # 已适配 Android 6.1.141 OKI；从本仓库 other_patch/ 拉取
-          # 顺序: bore -> bts
-          REPO_RAW="https://github.com/${GITHUB_REPOSITORY}/raw/refs/heads/${GITHUB_REF_NAME}/other_patch"
-          mkdir -p /tmp/oki_patches
-
-          declare -a PATCH_ORDER=(
-            "0001-bore.patch"
-            "0002-bore-tuning-sysctl.patch"
-          )
-
-          for pf in "${PATCH_ORDER[@]}"; do
-            echo ">>> 下载补丁: $pf"
-            wget -q -O "/tmp/oki_patches/$pf" "${REPO_RAW}/${pf}"
-            if [[ ! -s "/tmp/oki_patches/$pf" ]]; then
-              echo "❌ 下载失败或文件为空: $pf"
-              exit 1
-            fi
-          done
-
-          declare -a DRY_FAIL=()
-          declare -a DRY_OK=()
-          echo "=========================================="
-          echo "开始对全部补丁进行 Dry-run 预检..."
-          echo "=========================================="
-          for pf in "${PATCH_ORDER[@]}"; do
-            echo ""
-            echo ">>> Dry-run: $pf"
-            if patch --dry-run -p1 -N -F 3 -t < "/tmp/oki_patches/$pf"; then
-              echo "✅ Dry-run 通过: $pf"
-              DRY_OK+=("$pf")
-            else
-              echo "❌ Dry-run 失败: $pf"
-              DRY_FAIL+=("$pf")
-            fi
-          done
-
-          echo ""
-          echo "=========================================="
-          echo "Dry-run 汇总"
-          echo "=========================================="
-          echo "通过 (${#DRY_OK[@]}): ${DRY_OK[*]:-无}"
-          echo "失败 (${#DRY_FAIL[@]}): ${DRY_FAIL[*]:-无}"
-          if [[ ${#DRY_FAIL[@]} -gt 0 ]]; then
-            echo ""
-            echo "❌ 以下补丁 Dry-run 失败，终止工作流（未写入任何补丁）:"
-            for f in "${DRY_FAIL[@]}"; do
-              echo "  - $f"
-            done
-            exit 1
-          fi
-          echo "全部 Dry-run 通过，开始正式应用..."
-
-          for pf in "${PATCH_ORDER[@]}"; do
-            echo ">>> 正式应用: $pf"
-            if ! patch -p1 -N -F 3 -t < "/tmp/oki_patches/$pf"; then
-              echo "❌ 补丁应用失败: $pf"
-              exit 1
-            fi
-            echo "✅ 成功: $pf"
-          done
-
-          DEFCFG="./arch/arm64/configs/gki_defconfig"
-
-          case "$HZ_RATE" in
-            100|250|300|500|1000) ;;
-            *)
-              echo "❌ 不支持的 HZ: $HZ_RATE"
-              exit 1
-              ;;
-          esac
-          echo "设置 HZ=$HZ_RATE"
-          sed -i '/^CONFIG_HZ_/d' "$DEFCFG" || true
-          sed -i '/^# CONFIG_HZ_/d' "$DEFCFG" || true
-          sed -i '/^CONFIG_HZ=/d' "$DEFCFG" || true
-          echo "CONFIG_HZ_${HZ_RATE}=y" >> "$DEFCFG"
-          echo "CONFIG_HZ=$HZ_RATE" >> "$DEFCFG"
-
-          echo "CONFIG_SCHED_BORE=y" >> "$DEFCFG"
-          echo "BORE 调度器配置完成"
-
-      - name: 使用自愿抢占
-        if: inputs.preempt_voluntary
-        run: |
-          set -euo pipefail
-          DEFCFG="kernel_workspace/common/arch/arm64/configs/gki_defconfig"
-          # 清掉已有抢占模型，改为自愿抢占
-          sed -i '/^CONFIG_PREEMPT/d' "$DEFCFG" || true
-          sed -i '/^# CONFIG_PREEMPT/d' "$DEFCFG" || true
-          echo "CONFIG_PREEMPT_VOLUNTARY=y" >> "$DEFCFG"
-          echo "# CONFIG_PREEMPT is not set" >> "$DEFCFG"
-          echo "# CONFIG_PREEMPT_RT is not set" >> "$DEFCFG"
-          echo "已启用自愿抢占 PREEMPT_VOLUNTARY"
-
       - name: 添加SUSFS 配置项
         if: inputs.susfs_enable
         run: |
@@ -759,7 +643,7 @@ jobs:
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ github.ref_name }}
-         
+
       - name: 应用KPM并修补内核
         if: inputs.kpm_enable
         run: |
@@ -858,7 +742,7 @@ jobs:
       contents: write
       packages: write
       actions: read
-      
+
     steps:
       - name: 下载 ZIP 工件
         uses: actions/download-artifact@v8
