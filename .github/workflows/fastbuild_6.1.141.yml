@@ -90,13 +90,18 @@ on:
         required: true
         type: boolean
         default: 'false'
-      enable_bore_rt_uksm:
-        description: '启用 BORE+RT+UKSM 调优套件(含 BTS; 补丁来自仓库 other_patch/)'
+      enable_bore:
+        description: '添加 BORE 调度器(含 BTS 调优; 补丁来自仓库 other_patch/)'
+        required: true
+        type: boolean
+        default: 'false'
+      preempt_voluntary:
+        description: '使用自愿抢占(PREEMPT_VOLUNTARY; 关闭则为内核原有抢占模型)'
         required: true
         type: boolean
         default: 'false'
       hz_rate:
-        description: '内核定时器刷新率HZ(启用调优套件时建议250; 常用100/250/300/500/1000)'
+        description: '内核定时器刷新率HZ(添加 BORE 时生效; 常用100/250/300/500/1000)'
         required: false
         type: string
         default: '250'
@@ -350,8 +355,8 @@ jobs:
           cp ../SukiSU_patch/other/zram/zram_patch/${{ env.KERNEL_VERSION }}/lz4kd.patch ./
           patch -p1 -F 3 < lz4kd.patch || true
           
-      - name: 应用 BORE+RT+UKSM 调优套件
-        if: inputs.enable_bore_rt_uksm
+      - name: 添加 BORE 调度器
+        if: inputs.enable_bore
         run: |
           set -euo pipefail
           cd kernel_workspace/common
@@ -359,18 +364,15 @@ jobs:
           HZ_RATE="${HZ_RATE:-250}"
 
           # 已适配 Android 6.1.141 OKI；从本仓库 other_patch/ 拉取
-          # 顺序: bore -> bts -> rt -> uksm（已去掉 high-hz）
+          # 顺序: bore -> bts
           REPO_RAW="https://github.com/${GITHUB_REPOSITORY}/raw/refs/heads/${GITHUB_REF_NAME}/other_patch"
           mkdir -p /tmp/oki_patches
 
           declare -a PATCH_ORDER=(
             "0001-bore.patch"
             "0002-bore-tuning-sysctl.patch"
-            "0004-rt.patch"
-            "0005-uksm.patch"
           )
 
-          # ---- 1) 全部下载 ----
           for pf in "${PATCH_ORDER[@]}"; do
             echo ">>> 下载补丁: $pf"
             wget -q -O "/tmp/oki_patches/$pf" "${REPO_RAW}/${pf}"
@@ -380,7 +382,6 @@ jobs:
             fi
           done
 
-          # ---- 2) 全部 Dry-run，收集失败项（不中途退出）----
           declare -a DRY_FAIL=()
           declare -a DRY_OK=()
           echo "=========================================="
@@ -414,7 +415,6 @@ jobs:
           fi
           echo "全部 Dry-run 通过，开始正式应用..."
 
-          # ---- 3) 正式按顺序应用 ----
           for pf in "${PATCH_ORDER[@]}"; do
             echo ">>> 正式应用: $pf"
             if ! patch -p1 -N -F 3 -t < "/tmp/oki_patches/$pf"; then
@@ -441,18 +441,20 @@ jobs:
           echo "CONFIG_HZ=$HZ_RATE" >> "$DEFCFG"
 
           echo "CONFIG_SCHED_BORE=y" >> "$DEFCFG"
+          echo "BORE 调度器配置完成"
 
+      - name: 使用自愿抢占
+        if: inputs.preempt_voluntary
+        run: |
+          set -euo pipefail
+          DEFCFG="kernel_workspace/common/arch/arm64/configs/gki_defconfig"
+          # 清掉已有抢占模型，改为自愿抢占
           sed -i '/^CONFIG_PREEMPT/d' "$DEFCFG" || true
           sed -i '/^# CONFIG_PREEMPT/d' "$DEFCFG" || true
-          echo "CONFIG_PREEMPT_RT=y" >> "$DEFCFG"
-          echo "CONFIG_PREEMPT=y" >> "$DEFCFG"
-          echo "CONFIG_PREEMPTION=y" >> "$DEFCFG"
-          echo "CONFIG_HIGH_RES_TIMERS=y" >> "$DEFCFG"
-
-          echo "CONFIG_UKSM=y" >> "$DEFCFG"
-          echo "CONFIG_KSM=n" >> "$DEFCFG" || true
-
-          echo "BORE+RT+UKSM 套件配置完成"
+          echo "CONFIG_PREEMPT_VOLUNTARY=y" >> "$DEFCFG"
+          echo "# CONFIG_PREEMPT is not set" >> "$DEFCFG"
+          echo "# CONFIG_PREEMPT_RT is not set" >> "$DEFCFG"
+          echo "已启用自愿抢占 PREEMPT_VOLUNTARY"
 
       - name: 添加SUSFS 配置项
         if: inputs.susfs_enable
