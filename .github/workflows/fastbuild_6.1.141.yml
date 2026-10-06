@@ -90,13 +90,13 @@ on:
         required: true
         type: boolean
         default: 'false'
-      cachy_patches:
-        description: 'CachyOS/UKSM调优补丁列表(逗号分隔,按顺序应用; 支持: bore,bore-tuning-sysctl,lrng,high-hz,vma,rt,uksm; 留空则不应用)'
-        required: false
-        type: string
-        default: 'bore,rt'
+      enable_bore_rt_uksm:
+        description: '启用 BORE+RT+UKSM 调优套件(含 BTS 与 High-HZ; 补丁来自仓库 other_patch/)'
+        required: true
+        type: boolean
+        default: 'false'
       hz_rate:
-        description: '内核定时器刷新率HZ(常用100/250/300/500/1000,默认250)'
+        description: '内核定时器刷新率HZ(启用调优套件时建议250; 常用100/250/300/500/1000)'
         required: false
         type: string
         default: '250'
@@ -263,7 +263,7 @@ jobs:
           if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" || ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
             echo "正在配置BakaSU（由于SukiSU长期未维护无法正常编译，且BakaSU兼容sukisu管理器，故SukiSU源码仓库已重定向为bakasu）..."
             curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
-            echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
+            echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@overdosed"' >> ./common/arch/arm64/configs/gki_defconfig
             cd ./KernelSU
             # 生成自定义版本号（基于提交计数）, 失败时使用 114514
             KSU_VERSION=$(expr $(git rev-list --count main) + 30700 2>/dev/null || echo 114514)
@@ -350,114 +350,76 @@ jobs:
           cp ../SukiSU_patch/other/zram/zram_patch/${{ env.KERNEL_VERSION }}/lz4kd.patch ./
           patch -p1 -F 3 < lz4kd.patch || true
           
-      - name: 应用 CachyOS / UKSM / RT 调优补丁
+      - name: 应用 BORE+RT+UKSM 调优套件
+        if: inputs.enable_bore_rt_uksm
         run: |
           set -euo pipefail
           cd kernel_workspace/common
-          PATCHES_INPUT="${{ github.event.inputs.cachy_patches }}"
           HZ_RATE="${{ github.event.inputs.hz_rate }}"
           HZ_RATE="${HZ_RATE:-250}"
 
-          # 规范化输入：去空格、转小写
-          PATCHES_INPUT=$(echo "$PATCHES_INPUT" | tr 'A-Z' 'a-z' | tr -d ' ')
-          if [[ -z "$PATCHES_INPUT" ]]; then
-            echo "未指定 CachyOS 调优补丁，跳过补丁应用。"
-          else
-            mkdir -p /tmp/cachy_patches
-            IFS=',' read -ra PATCH_LIST <<< "$PATCHES_INPUT"
-            declare -A PATCH_URLS=(
-              ["bore"]="https://raw.githubusercontent.com/CachyOS/kernel-patches/master/6.1/sched/0001-bore.patch"
-              ["bore-tuning-sysctl"]="https://raw.githubusercontent.com/CachyOS/kernel-patches/master/6.1/misc/0001-bore-tuning-sysctl.patch"
-              ["lrng"]="https://raw.githubusercontent.com/CachyOS/kernel-patches/master/6.1/misc/0001-lrng.patch"
-              ["high-hz"]="https://raw.githubusercontent.com/CachyOS/kernel-patches/master/6.1/misc/0001-high-hz.patch"
-              ["vma"]="https://raw.githubusercontent.com/CachyOS/kernel-patches/master/6.1/misc/0001-Introduce-per-VMA-lock.patch"
-              ["uksm"]="https://raw.githubusercontent.com/sroeschus/uksm/main/v6.x/uksm-v6.1.patch"
-              ["rt"]="https://raw.githubusercontent.com/CachyOS/kernel-patches/master/6.1/misc/0001-rt.patch"
-            )
+          # 已适配 Android 6.1.141 OKI 的补丁，从本仓库 other_patch/ 拉取
+          # 顺序: bore -> bts -> high-hz -> rt -> uksm
+          REPO_RAW="https://github.com/${GITHUB_REPOSITORY}/raw/refs/heads/${GITHUB_REF_NAME}/other_patch"
+          mkdir -p /tmp/oki_patches
 
-            for p in "${PATCH_LIST[@]}"; do
-              [[ -z "$p" ]] && continue
-              if [[ -z "${PATCH_URLS[$p]+x}" ]]; then
-                echo "❌ 未知补丁名: $p （支持: bore,bore-tuning-sysctl,lrng,high-hz,vma,rt,uksm）"
-                exit 1
-              fi
-              url="${PATCH_URLS[$p]}"
-              out="/tmp/cachy_patches/${p}.patch"
-              echo ">>> 下载补丁: $p"
-              echo "    URL: $url"
-              wget -q -O "$out" "$url"
-              if [[ ! -s "$out" ]]; then
-                echo "❌ 下载失败或文件为空: $p"
-                exit 1
-              fi
-              echo ">>> Dry-run 检查: $p"
-              if ! patch --dry-run -p1 -N -F 3 --verbose < "$out"; then
-                echo "❌ 补丁 dry-run 失败，立即终止工作流: $p"
-                exit 1
-              fi
-              echo ">>> 正式应用补丁: $p"
-              if ! patch -p1 -N -F 3 --verbose < "$out"; then
-                echo "❌ 补丁应用失败，立即终止工作流: $p"
-                exit 1
-              fi
-              echo "✅ 补丁应用成功: $p"
-            done
-          fi
+          declare -a PATCH_ORDER=(
+            "0001-bore.patch"
+            "0002-bore-tuning-sysctl.patch"
+            "0003-high-hz.patch"
+            "0004-rt.patch"
+            "0005-uksm.patch"
+          )
 
-          # ---- 配置项：HZ / BORE / RT / UKSM / LRNG / VMA ----
+          for pf in "${PATCH_ORDER[@]}"; do
+            echo ">>> 下载补丁: $pf"
+            wget -q -O "/tmp/oki_patches/$pf" "${REPO_RAW}/${pf}"
+            if [[ ! -s "/tmp/oki_patches/$pf" ]]; then
+              echo "❌ 下载失败或文件为空: $pf"
+              exit 1
+            fi
+            echo ">>> Dry-run: $pf"
+            if ! patch --dry-run -p1 -N -F 3 -t < "/tmp/oki_patches/$pf"; then
+              echo "❌ 补丁 dry-run 失败: $pf"
+              exit 1
+            fi
+            echo ">>> 正式应用: $pf"
+            if ! patch -p1 -N -F 3 -t < "/tmp/oki_patches/$pf"; then
+              echo "❌ 补丁应用失败: $pf"
+              exit 1
+            fi
+            echo "✅ 成功: $pf"
+          done
+
           DEFCFG="./arch/arm64/configs/gki_defconfig"
 
-          # HZ
           case "$HZ_RATE" in
             100|250|300|500|1000) ;;
             *)
-              echo "❌ 不支持的 HZ 值: $HZ_RATE （支持 100/250/300/500/1000）"
+              echo "❌ 不支持的 HZ: $HZ_RATE"
               exit 1
               ;;
           esac
-          echo "设置内核 HZ=$HZ_RATE"
-          # 清理旧 HZ 相关配置
+          echo "设置 HZ=$HZ_RATE"
           sed -i '/^CONFIG_HZ_/d' "$DEFCFG" || true
           sed -i '/^# CONFIG_HZ_/d' "$DEFCFG" || true
           sed -i '/^CONFIG_HZ=/d' "$DEFCFG" || true
           echo "CONFIG_HZ_${HZ_RATE}=y" >> "$DEFCFG"
           echo "CONFIG_HZ=$HZ_RATE" >> "$DEFCFG"
 
-          # 按补丁列表启用对应配置
-          if echo ",${PATCHES_INPUT}," | grep -q ',bore,'; then
-            echo "启用 BORE 调度器为默认"
-            echo "CONFIG_SCHED_BORE=y" >> "$DEFCFG"
-          fi
+          echo "CONFIG_SCHED_BORE=y" >> "$DEFCFG"
 
-          if echo ",${PATCHES_INPUT}," | grep -q ',rt,'; then
-            echo "启用 PREEMPT_RT 抢占模型"
-            # 清理其他抢占模型
-            sed -i '/^CONFIG_PREEMPT/d' "$DEFCFG" || true
-            sed -i '/^# CONFIG_PREEMPT/d' "$DEFCFG" || true
-            echo "CONFIG_PREEMPT_RT=y" >> "$DEFCFG"
-            echo "CONFIG_PREEMPT=y" >> "$DEFCFG"
-            echo "CONFIG_PREEMPTION=y" >> "$DEFCFG"
-            echo "CONFIG_HIGH_RES_TIMERS=y" >> "$DEFCFG"
-          fi
+          sed -i '/^CONFIG_PREEMPT/d' "$DEFCFG" || true
+          sed -i '/^# CONFIG_PREEMPT/d' "$DEFCFG" || true
+          echo "CONFIG_PREEMPT_RT=y" >> "$DEFCFG"
+          echo "CONFIG_PREEMPT=y" >> "$DEFCFG"
+          echo "CONFIG_PREEMPTION=y" >> "$DEFCFG"
+          echo "CONFIG_HIGH_RES_TIMERS=y" >> "$DEFCFG"
 
-          if echo ",${PATCHES_INPUT}," | grep -q ',uksm,'; then
-            echo "启用 UKSM"
-            echo "CONFIG_UKSM=y" >> "$DEFCFG"
-            # 与 KSM 二选一时优先 UKSM（若补丁提供 choice）
-            echo "CONFIG_KSM=n" >> "$DEFCFG" || true
-          fi
+          echo "CONFIG_UKSM=y" >> "$DEFCFG"
+          echo "CONFIG_KSM=n" >> "$DEFCFG" || true
 
-          if echo ",${PATCHES_INPUT}," | grep -q ',lrng,'; then
-            echo "启用 LRNG"
-            echo "CONFIG_LRNG=y" >> "$DEFCFG"
-            # 可选：关闭默认 random 实现，完全使用 LRNG（按需）
-            # echo "CONFIG_RANDOM_DEFAULT_IMPL=n" >> "$DEFCFG"
-          fi
-
-          if echo ",${PATCHES_INPUT}," | grep -q ',vma,'; then
-            echo "启用 per-VMA lock"
-            echo "CONFIG_PER_VMA_LOCK=y" >> "$DEFCFG"
-          fi
+          echo "BORE+RT+UKSM 套件配置完成"
 
       - name: 添加SUSFS 配置项
         if: inputs.susfs_enable
